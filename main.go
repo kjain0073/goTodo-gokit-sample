@@ -2,45 +2,72 @@ package main
 
 import (
 	"context"
-	"log"
+	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
-	"time"
+	"syscall"
 
-	"github.com/go-chi/chi"
-	"github.com/go-chi/chi/middleware"
-	"github.com/kjain0073/go-Todo/middlewareTodo"
-	"github.com/kjain0073/go-Todo/router"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/kjain0073/go-Todo/tasks"
+	mgo "gopkg.in/mgo.v2"
 )
 
 func main() {
-	stopChan := make(chan os.Signal) // correct way to stop channel
-	signal.Notify(stopChan, os.Interrupt)
-	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Get("/", middlewareTodo.HomeHandler)
-	r.Mount("/todo", router.TodoHandlers())
-
-	srv := &http.Server{
-		Addr:         middlewareTodo.Port,
-		Handler:      r,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  60 * time.Second,
+	var httpAddr = flag.String("http", ":8081", "http listen address")
+	var logger log.Logger
+	{
+		logger = log.NewLogfmtLogger(os.Stderr)
+		logger = log.NewSyncLogger(logger)
+		logger = log.With(logger,
+			"service", "tasks",
+			"time:", log.DefaultTimestampUTC,
+			"caller", log.DefaultCaller,
+		)
 	}
-	go func() {
-		log.Println("listening on port", middlewareTodo.Port)
-		if err := srv.ListenAndServe(); err != nil {
-			log.Printf("listen:%s\n", err)
+
+	level.Info(logger).Log("msg", "service started")
+	defer level.Info(logger).Log("msg", "service ended")
+
+	var db *mgo.Database
+	{
+		// to connect with DB
+		sess, err := mgo.Dial(tasks.HostName)
+		if err != nil {
+			level.Error(logger).Log("exit", err)
+			os.Exit(-1)
 		}
+		sess.SetMode(mgo.Monotonic, true)
+		db = sess.DB(tasks.DbName)
+	}
+
+	flag.Parse()
+	ctx := context.Background()
+	var srv tasks.Service
+	{
+		repository := tasks.NewRepo(db, logger)
+
+		srv = tasks.NewService(repository, logger)
+	}
+
+	errs := make(chan error)
+
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+		errs <- fmt.Errorf("%s", <-c)
 	}()
 
-	<-stopChan
-	log.Println("Shutting down Server...")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	srv.Shutdown(ctx)
-	defer cancel()
-	log.Println("Server stopped Gracefully!")
+	endpoints := tasks.MakeEndpoints(srv)
+
+	go func() {
+		fmt.Println("listening on port", *httpAddr)
+		handler := tasks.NewHTTPServer(ctx, endpoints)
+		errs <- http.ListenAndServe(*httpAddr, handler)
+	}()
+
+	level.Error(logger).Log("exit", <-errs)
 
 }
